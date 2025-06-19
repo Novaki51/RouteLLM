@@ -1,111 +1,143 @@
+import os
+import json
+import subprocess
+from datetime import datetime
+import tkinter as tk
+from tkinter import simpledialog, messagebox
 import osmnx as ox
 import networkx as nx
 import geopandas as gpd
 import matplotlib.pyplot as plt
 from shapely.geometry import LineString, MultiLineString
-import tkinter as tk
-from tkinter import simpledialog, messagebox
-from datetime import datetime
-import subprocess
-import json
 
-# ─────────────────────────────────────
-# 1. Egyedi fájlnevek (dátum alapján)
-# ─────────────────────────────────────
+# ───────────────────────────────
+# 1. Interaktív felhasználói bemenet
+# ───────────────────────────────
+root = tk.Tk()
+root.withdraw()
+
+start_address = simpledialog.askstring("Kiindulópont", "Add meg a kiindulási címet:")
+end_address = simpledialog.askstring("Célpont", "Add meg a célcímet:")
+prompt_input = simpledialog.askstring("Útvonal leírás", "Írd le az igényeket (pl. konvoj, waypointok, kitérő):")
+model_name = simpledialog.askstring("LLM modell (Ollama)", "Melyik Ollama modellt használjuk? (pl. llama3)", initialvalue="llama3:8b")
+
+if not start_address or not end_address:
+    messagebox.showerror("Hiba", "Kiindulópont és célpont kötelező!")
+    exit()
+
+# ───────────────────────────────
+# 2. JSON választ kérünk az LLM-től (Ollama CLI)
+# ───────────────────────────────
+llm_prompt = f"""
+Tervezd meg az útvonalat Budapest területén.
+- Kiindulópont: {start_address}
+- Célpont: {end_address}
+- Igény: {prompt_input}
+
+Kérek kizárólag érvényes JSON-t az alábbi mezőkkel:
+{{
+  "network_type": "drive|bike|walk",
+  "waypoints": ["hely1", "hely2"],
+  "split_routes": true|false,
+  "priority": "safety|speed",
+  "allow_detour_km": float
+}}
+"""
+#print(llm_prompt)
+try:
+    result = subprocess.run(
+        ["ollama", "run", model_name, llm_prompt],
+        capture_output=True,
+        text=True,
+    )
+
+    response_text = result.stdout.strip()
+    print(response_text)
+    json_start = response_text.find("{")
+    json_end = response_text.rfind("}") + 1
+    config = json.loads(response_text[json_start:json_end])
+
+    network_type = config.get("network_type", "drive")
+    waypoints = config.get("waypoints", [])
+    split_routes = config.get("split_routes", False)
+    priority = config.get("priority", "length")  # 'safety' vagy 'speed'
+    detour_km = config.get("allow_detour_km", 0.0)
+
+except Exception as e:
+    messagebox.showwarning("LLM hiba", f"Nem sikerült feldolgozni az LLM választ, alapértelmezést használunk.\n{e}")
+    network_type = "drive"
+    waypoints = []
+    split_routes = False
+    priority = "length"
+    detour_km = 0.0
+
+# ───────────────────────────────
+# 3. OSM úthálózat betöltése
+# ───────────────────────────────
+print(f"Úthálózat betöltése ({network_type})...")
+G = ox.graph_from_place("Budapest, Hungary", network_type=network_type)
+
+def geocode_node(address):
+    latlon = ox.geocode(address + ", Budapest, Hungary")
+    return ox.nearest_nodes(G, latlon[1], latlon[0])
+
+locations = [start_address] + waypoints + [end_address]
+node_list = [geocode_node(loc) for loc in locations]
+
+# ───────────────────────────────
+# 4. Útvonal kiszámítása
+# ───────────────────────────────
+routes = []
+
+if split_routes and len(locations) > 2:
+    for i in range(len(locations) - 1):
+        routes.append(nx.shortest_path(G, node_list[i], node_list[i+1], weight="length"))
+else:
+    full_route = []
+    for i in range(len(locations) - 1):
+        segment = nx.shortest_path(G, node_list[i], node_list[i+1], weight="length")
+        if i > 0:
+            segment = segment[1:]
+        full_route += segment
+    routes = [full_route]
+
+# ───────────────────────────────
+# 5. Fájlnevek létrehozása
+# ───────────────────────────────
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 geojson_filename = f"utvonal_{timestamp}.geojson"
 png_filename = f"utvonal_{timestamp}.png"
 
-# ─────────────────────────────────────
-# 2. GUI: input mezők
-# ─────────────────────────────────────
-root = tk.Tk()
-root.withdraw()
+# ───────────────────────────────
+# 6. GeoJSON mentése
+# ───────────────────────────────
+gdf_list = []
+all_edges = []
 
-start_address = simpledialog.askstring("Útvonaltervezés", "Add meg a kiindulási pontot:")
-end_address = simpledialog.askstring("Útvonaltervezés", "Add meg a célpontot:")
-task_description = simpledialog.askstring("LLM prompt", "Írd le, milyen típusú útvonalra van szükség (pl. konvoj, bicikli, biztonságos stb.)")
+for route in routes:
+    coords = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in route]
+    line = LineString(coords)
+    gdf_list.append(line)
+    all_edges += [
+        LineString([(G.nodes[u]['x'], G.nodes[u]['y']),
+                    (G.nodes[v]['x'], G.nodes[v]['y'])])
+        for u, v in zip(route[:-1], route[1:])
+    ]
 
-if not start_address or not end_address:
-    messagebox.showerror("Hiba", "Mindkét pontot meg kell adni.")
-    exit()
-model_name = simpledialog.askstring("LLM modell", "Melyik Ollama modellt használjuk? (pl. llama3, mistral, gemma)")
-
-if not model_name:
-    messagebox.showwarning("Modell megadása hiányzik", "Alapértelmezett modell: llama3:8b")
-    model_name = "llama3:8b"
-
-
-# ─────────────────────────────────────
-# 3. LLM (Ollama) prompt küldése
-# ─────────────────────────────────────
-try:
-    prompt = f"""Tervezd meg az optimális útvonalat Budapest területén a következő paraméterek alapján:
-- Kiindulópont: {start_address}
-- Célpont: {end_address}
-- Speciális igények: {task_description}
-
-Válaszolj JSON-ben, a következő formátumban:
-{{
-  "network_type": "<drive|bike|walk>",
-  "comment": "<egyéb megjegyzés>"
-}}"""
-
-    result = subprocess.run(
-        ["ollama", "run", model_name, prompt],
-        capture_output=True,
-        text=True
-    )
-
-    llm_output = result.stdout.strip()
-    json_start = llm_output.find("{")
-    json_end = llm_output.rfind("}") + 1
-    llm_json = json.loads(llm_output[json_start:json_end])
-    network_type = llm_json.get("network_type", "drive")
-except Exception as e:
-    messagebox.showwarning("LLM hiba", f"Nem sikerült az LLM válasz feldolgozása. Alapértelmezett: autó\n{str(e)}")
-    network_type = "drive"
-
-# ─────────────────────────────────────
-# 4. Úthálózat lekérése
-# ─────────────────────────────────────
-print(f"Úthálózat letöltése ({network_type})...")
-G = ox.graph_from_place("Budapest, Hungary", network_type=network_type)
-
-# ─────────────────────────────────────
-# 5. Csomópontok, útvonal
-# ─────────────────────────────────────
-start_coords = ox.geocode(start_address + ", Budapest, Hungary")
-end_coords = ox.geocode(end_address + ", Budapest, Hungary")
-
-start_node = ox.nearest_nodes(G, start_coords[1], start_coords[0])
-end_node = ox.nearest_nodes(G, end_coords[1], end_coords[0])
-
-route = nx.shortest_path(G, start_node, end_node, weight="length")
-
-# ─────────────────────────────────────
-# 6. GeoJSON mentés
-# ─────────────────────────────────────
-route_coords = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in route]
-route_line = LineString(route_coords)
-
-gdf = gpd.GeoDataFrame(index=[0], geometry=[route_line], crs="EPSG:4326")
+gdf = gpd.GeoDataFrame(geometry=gdf_list, crs="EPSG:4326")
 gdf.to_file(geojson_filename, driver="GeoJSON")
 
-# ─────────────────────────────────────
-# 7. PNG térkép mentése zoomolva
-# ─────────────────────────────────────
-fig, ax = ox.plot_graph_route(G, route, route_linewidth=4, node_size=0, bgcolor="white", show=False, close=False, figsize=(12, 12))
-
-edge_lines = [LineString([(G.nodes[u]['x'], G.nodes[u]['y']),
-                          (G.nodes[v]['x'], G.nodes[v]['y'])]) for u, v in zip(route[:-1], route[1:])]
-route_geom = MultiLineString(edge_lines)
-buffered = route_geom.buffer(0.001)
-
-ax.set_xlim(buffered.bounds[0], buffered.bounds[2])
-ax.set_ylim(buffered.bounds[1], buffered.bounds[3])
-
+# ───────────────────────────────
+# 7. PNG térkép generálása
+# ───────────────────────────────
+fig, ax = ox.plot_graph_routes(G, routes, route_colors='r', route_linewidth=4, node_size=0, bgcolor="white", show=False, close=False, figsize=(12, 12))
+combined = MultiLineString(all_edges).buffer(0.001)
+ax.set_xlim(combined.bounds[0], combined.bounds[2])
+ax.set_ylim(combined.bounds[1], combined.bounds[3])
 plt.savefig(png_filename, dpi=300)
 plt.close()
 
-messagebox.showinfo("Siker", f"Fájlok elmentve:\n{geojson_filename}\n{png_filename}")
+# ───────────────────────────────
+# 8. Visszajelzés
+# ───────────────────────────────
+messagebox.showinfo("Siker", f"Útvonal mentve:\n{geojson_filename}\n{png_filename}")

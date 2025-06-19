@@ -29,10 +29,10 @@ if not start_address or not end_address:
     exit()
 
 # ───────────────────────────────────────
-# 3. Úthálózat letöltése (IX. kerület)
+# 3. Úthálózat letöltése
 # ───────────────────────────────────────
 print("Úthálózat letöltése...")
-G = ox.graph_from_place("Budapest IX., Hungary", network_type="drive")
+G = ox.graph_from_place("Budapest, Hungary", network_type="drive")
 
 # ───────────────────────────────────────
 # 4. Helyek geokódolása és útvonal
